@@ -1,32 +1,40 @@
 import time
+import os
+from typing import Optional
 from rich.layout import Layout
 from rich.live import Live
 from rich.text import Text
 from rich.tree import Tree
 from rich.table import Table
+from rich.panel import Panel
 from rich.console import Group, Console
-from typing import Optional
 from . import ingest
 from .args import Args
-import os
 
 if os.name == "nt":
     import msvcrt
 
     def get_key() -> Optional[int]:
+        """Get a single key press for Windows."""
         if msvcrt.kbhit():
-            return msvcrt.getch()[0]
-        else:
-            return None
+            return ord(msvcrt.getch())
+        return None
 
 else:
-    import getchlib
+    import termios
+    import sys
+    import tty
 
     def get_key() -> Optional[int]:
-        stkey = getchlib.getkey(False)  # type: Optional[str]
-        if stkey and len(stkey) == 1:
-            return ord(stkey)
-        return None
+        """Get a single key press for Unix-like systems."""
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ord(ch) if ch else None
 
 
 class InteractiveRegions:
@@ -115,13 +123,11 @@ class InteractiveRegions:
 
     def reg_section_text(self, reg: ingest.RegionWithSections) -> Text:
         fullness = reg.used_mem() / reg.data.length
-        if fullness > 0.9:
-            pc_colour = "bright_red"
-        elif fullness > 0.75:
-            pc_colour = "bright_magenta"
-        else:
-            pc_colour = ""
-
+        pc_colour = (
+            "bright_red" if fullness > 0.9 else
+            "bright_magenta" if fullness > 0.75 else
+            ""
+        )
         return Text.assemble(
             (reg.data.name, ""),
             " ",
@@ -161,11 +167,21 @@ class InteractiveRegions:
                 section.children.sort(key=lambda x: x.size, reverse=True)
             region.children.sort(key=lambda x: x.data.size, reverse=True)
         self.set_selection_to(original_selection)
+    
+    def sort_by_name(self) -> None:
+        original_selection = self.selected_section()
+        self.sorted_by_size = False  # As we are sorting by name now, it's no longer size-based
+        for region in self.regions:
+            if len(region.children) == 0:
+                continue
+            for section in region.children:
+                section.children.sort(key=lambda x: x.name.lower())  # Sorting by name
+            region.children.sort(key=lambda s: s.data.name.lower())  # Sorting sections by name
+        self.set_selection_to(original_selection)
 
     def sort_by_addr(self) -> None:
         original_selection = self.selected_section()
         self.sorted_by_size = False
-
         for region in self.regions:
             if len(region.children) == 0:
                 continue
@@ -196,87 +212,80 @@ def size_display(numbytes: int) -> str:
     chosen_format = max([f for f in fmt_options if len(f) <= 4], key=len)
     return chosen_format + " " + symbol
 
+def whole_thing(o_data: InteractiveRegions, terminal_height: int) -> Layout:
+    """Generate the entire display layout for the CLI application."""
+    layout = Layout()
+    layout.split(
+        Layout(name="header", size=3),
+        Layout(name="body"),
+        Layout(name="footer", size=3),
+    )
+
+    # Header: Region Information
+    header_text = Text(f"Selected Region: {o_data.selected_region().data.name}")
+    header_text.stylize("bold green")
+    header_panel = Panel(header_text, title="Region Overview", border_style="bright_blue")
+    layout["header"].update(header_panel)
+
+    # Body: Sections and Objects
+    body_layout = Layout()
+    body_layout.split_row(
+        Layout(name="sections", ratio=1),
+        Layout(name="objects", ratio=2),
+    )
+
+    # Sections
+    sections_tree = Tree("Sections")
+    for section in o_data.selected_region().children:
+        section_text = o_data.section_text(section, o_data.selected_region().data.length)
+        sections_tree.add(
+            section_text,
+            guide_style="bright_magenta",
+            style="on bright_blue" if section == o_data.selected_section() else None,
+        )
+
+    body_layout["sections"].update(Panel(sections_tree, title="Sections"))
+
+    # Objects in Selected Section
+    objects_table = Table(title="Objects in Section")
+    objects_table.add_column("Address", justify="right", style="cyan")
+    objects_table.add_column("Size", justify="right", style="yellow")
+    objects_table.add_column("Name", style="white")
+
+    for obj in o_data.objects_in_view():
+        objects_table.add_row(
+            f"0x{obj.addr:X}",
+            size_display(obj.size),
+            obj.name,
+        )
+
+    body_layout["objects"].update(Panel(objects_table))
+
+    layout["body"].update(body_layout)
+
+    # Footer: Navigation Instructions
+    footer_text = Text(
+        "[W] Previous Section  [S] Next Section  [E] Previous Page  [D] Next Page  "
+        "[Q] Toggle sort by Size/Address  [A] Sort by Name  [Esc] Exit"
+    )
+    footer_text.stylize("dim white")
+    footer_panel = Panel(footer_text, title="Controls", border_style="bright_green")
+    layout["footer"].update(footer_panel)
+
+    return layout
+
 
 def cli() -> None:
+    """Main CLI entry point."""
     o_data = InteractiveRegions(ingest.ingest())
+    console = Console()
 
-    def region_view(data: InteractiveRegions, compact: bool) -> Group:
-        title = Text.assemble(
-            str(Args().elf_file().parts[-1]),
-            ", ",
-            str(Args().map_file().parts[-1]),
-            style="bright_green",
-        )
-        treeitems = []  # type: list[Tree]
-        for reg in data.regions:
-            region_title = o_data.reg_section_text(reg)
-            is_selected = reg == o_data.selected_region()
-            if compact and not is_selected:
-                region_title.append(f" [{len(reg.children)}]", style="bright_green")
-            reg_tree = Tree(region_title, guide_style="bright_black")
-            if (not compact) or reg == o_data.selected_region():
-                for sec in reg.children:
-                    reg_tree.add(o_data.section_text(sec, reg.data.length))
-                reg_tree.add(o_data.reg_totals_text(reg))
-            treeitems.append(reg_tree)
-        return Group(title, *treeitems)
+    def render():
+        live.update(whole_thing(o_data, console.height), refresh=True)
 
-    def obj_view(data: InteractiveRegions) -> Table:
-        numpages = int(
-            1 + (len(data.selected_section().children) / data.objects_per_page)
-        )
-        table = Table(
-            title=f"{data.selected_section().data.name} (Page {data.object_page + 1}/{numpages})",
-            row_styles=["", "dim"],
-            title_justify="left",
-        )
-        table.add_column("Size", justify="right", style="yellow", width=6)
-        table.add_column("Address", justify="right", width=10)
-        table.add_column("Symbol Name")
-        for obj in data.objects_in_view():
-            table.add_row(size_display(obj.size), f"{obj.addr:#010x}", obj.name)
-
-        return table
-
-    def whole_thing(data: InteractiveRegions, viewport_height: int) -> Layout:
-        grid = Table.grid()
-        grid.add_column()
-        grid.add_column()
-        num_sections = len([s for reg in data.regions for s in reg.children])
-        full_tree_height = 1 + 2 * len(data.regions) + num_sections
-        compressed = full_tree_height >= viewport_height
-        grid.add_row(
-            region_view(data, compressed),
-            obj_view(data),
-        )
-        grid.padding = 2
-        layout = Layout()
-
-        layout.split_column(
-            Layout(name="u"),
-            Layout(
-                name="l",
-                size=1,
-            ),
-        )
-        sortkind = "Size" if o_data.sorted_by_size else "Addr"
-        layout["u"].update(grid)
-        layout["l"].update(
-            Text(
-                "  W/S: Move between sections | "
-                "E/D: Scroll symbol table | "
-                "Esc: Exit | "
-                f"Sorted by (Q): {sortkind} ",
-                style="black on white",
-            ),
-        )
-        return layout
-
-    with Live("", auto_refresh=False) as live:
+    with Live("", auto_refresh=False, console=console) as live:
         last_size = live.console.size
-        o_data.update_objs_per_page(live.console)
-        def render():
-            live.update(whole_thing(o_data, live.console.height), refresh=True)
+        o_data.update_objs_per_page(console)
         render()
         while True:
             if key := get_key():
@@ -298,15 +307,18 @@ def cli() -> None:
                     else:
                         o_data.sort_by_size()
                     render()
-                elif key == 27:  # Escape
+                elif key == ord("a"):  # Add sorting by name on "A" key press
+                    o_data.sort_by_name()
+                    render()
+                elif key == 27:  # Escape key
                     live.update("", refresh=True)
                     exit(0)
             else:
                 if live.console.size != last_size:
                     last_size = live.console.size
-                    o_data.update_objs_per_page(live.console)
+                    o_data.update_objs_per_page(console)
                     render()
-                time.sleep(5e-3)
+                time.sleep(0.05)
 
 
 if __name__ == "__main__":
